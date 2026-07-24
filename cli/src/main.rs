@@ -1823,6 +1823,12 @@ fn run_batch(
                     if let Some(ref code) = resp.code {
                         result["code"] = json!(code);
                     }
+                    // Same reason as `code`: a warning (e.g. a failed binding
+                    // persistence) is surfaced on the single-command path and
+                    // must not be silently dropped in batch mode.
+                    if let Some(ref warning) = resp.warning {
+                        result["warning"] = json!(warning);
+                    }
                     results.push(result);
                 } else {
                     if i > 0 {

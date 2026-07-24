@@ -1983,15 +1983,18 @@ impl BrowserManager {
     /// Single decision point for both CDP-event-discovered target drains
     /// (`Target.attachedToTarget` and `Target.targetCreated` handlers in
     /// actions.rs). If the target is already tracked, only its metadata is
-    /// refreshed in place. Otherwise a new page is appended WITHOUT
-    /// activation: event-discovered targets (a tab the human opened in the
-    /// shared Chrome, or a JS-opened popup) must never steal the agent's
-    /// active tab or overwrite the pin binding. Explicit agent commands
-    /// (`tab new`, `window new`, `click --new-tab`) register their own page
-    /// via `add_page` on their own path and never go through this function.
-    /// Both drain handlers call this one function so the activation policy
-    /// can't diverge between them; a regression here breaks both handlers
-    /// at once and is caught by `test_register_discovered_page_*` below.
+    /// refreshed in place. Otherwise a new page is appended, and activation
+    /// depends on the pin mode: a pinned session never lets an
+    /// event-discovered target (a tab the human opened in the shared Chrome,
+    /// or a JS-opened popup) steal the active tab or overwrite the pin
+    /// binding, while a legacy (non-pin) session keeps following the newest
+    /// tab so downstream scoping (e.g. a11y frame sessions) tracks it.
+    /// Explicit agent commands (`tab new`, `window new`, `click --new-tab`)
+    /// register their own page via `add_page` on their own path and never go
+    /// through this function. Both drain handlers call this one function so
+    /// the activation policy can't diverge between them; a regression here
+    /// breaks both handlers at once and is caught by
+    /// `test_register_discovered_page_*` below.
     pub fn register_discovered_page(
         &mut self,
         target_id: &str,
@@ -2007,15 +2010,21 @@ impl BrowserManager {
             return false;
         }
         let tab_id = self.assign_tab_id();
-        self.add_page_without_activation(PageInfo {
-            tab_id,
-            label: None,
-            target_id: target_id.to_string(),
-            session_id: session_id.to_string(),
-            url,
-            title,
-            target_type,
-        });
+        // Pinned sessions never activate a discovered tab (strict no-steal);
+        // legacy sessions follow it, matching pre-pin behavior.
+        let activate = !self.pin_tab;
+        self.add_page_with_activation(
+            PageInfo {
+                tab_id,
+                label: None,
+                target_id: target_id.to_string(),
+                session_id: session_id.to_string(),
+                url,
+                title,
+                target_type,
+            },
+            activate,
+        );
         true
     }
 
@@ -3049,6 +3058,33 @@ mod tests {
     /// call is reverted from `add_page_without_activation` to `add_page`, this
     /// test fails, and BOTH actions.rs call sites are broken simultaneously
     /// since there is no other path to diverge through.
+    /// A legacy (non-pin) session must keep following an event-discovered tab:
+    /// the no-steal rule is scoped to pinned sessions, so downstream scoping
+    /// (a11y frame sessions) still tracks a popup. Force-red: unconditionally
+    /// register discovered pages without activation and the active tab stays on
+    /// TARGET_A here.
+    #[tokio::test]
+    async fn test_register_discovered_page_activates_for_non_pin_session() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        // No set_pin_tab(true): legacy session, active on its only tab.
+        assert_eq!(mgr.active_target_id().unwrap(), TARGET_A);
+
+        let newly_added = mgr.register_discovered_page(
+            TARGET_B,
+            "session-b",
+            "https://popup.example".to_string(),
+            String::new(),
+            "page".to_string(),
+        );
+
+        assert!(newly_added, "an untracked target must be registered");
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            TARGET_B,
+            "a non-pin session must follow the newly discovered tab (legacy behavior)"
+        );
+    }
+
     #[tokio::test]
     async fn test_register_discovered_page_untracked_target_does_not_steal_pinned_tab() {
         let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;

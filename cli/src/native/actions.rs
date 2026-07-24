@@ -2173,11 +2173,35 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             // Rewrite the persisted pinned state immediately: relying on the
             // next browser-touching command would lose the change if the
             // daemon restarts first (there may be no browser at all, e.g.
-            // when disabling a pin to recover a stuck session).
-            if let Ok(Some(mut binding)) = tab_binding::load(&state.session_id) {
-                if binding.pinned != pin {
-                    binding.pinned = pin;
-                    let _ = tab_binding::save(&state.session_id, &binding);
+            // when disabling a pin to recover a stuck session). A load/save
+            // error here must fail loudly, not report success and silently
+            // restore the old state after restart.
+            match tab_binding::load(&state.session_id) {
+                Ok(Some(mut binding)) => {
+                    if binding.pinned != pin {
+                        binding.pinned = pin;
+                        if let Err(e) = tab_binding::save(&state.session_id, &binding) {
+                            return error_response(
+                                &id,
+                                &format!(
+                                    "cannot persist the pin-tab setting: {} — the change \
+                                     would not survive a daemon restart",
+                                    e
+                                ),
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return error_response(
+                        &id,
+                        &format!(
+                            "cannot read the session tab binding to update the pin state: {} \
+                             — delete the file to reset the session's tab binding",
+                            e
+                        ),
+                    );
                 }
             }
             // Force write-on-change to re-persist from the live snapshot.
