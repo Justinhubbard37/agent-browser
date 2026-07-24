@@ -2165,13 +2165,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     // absence of the field leaves the current state untouched.
     match cmd.get("pinTab").and_then(|v| v.as_bool()) {
         Some(pin) if pin != state.pin_tab => {
-            state.pin_tab = pin;
-            if let Some(ref mut mgr) = state.browser {
-                mgr.set_pin_tab(pin);
-            }
-            // Persist the pinned state now, not on the next command, so a
-            // restart can't drop it. A load/save error fails the toggle
-            // rather than reporting a success that won't survive a restart.
+            // Persist the pinned state before committing it to live state, so a
+            // load/save failure leaves the daemon exactly as it was instead of
+            // reporting an error while the isolation mode already flipped.
             match tab_binding::load(&state.session_id) {
                 Ok(Some(mut binding)) => {
                     if binding.pinned != pin {
@@ -2180,8 +2176,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                             return error_response(
                                 &id,
                                 &format!(
-                                    "cannot persist the pin-tab setting: {} — the change \
-                                     would not survive a daemon restart",
+                                    "cannot persist the pin-tab setting: {}. The change was \
+                                     not applied.",
                                     e
                                 ),
                             );
@@ -2193,14 +2189,19 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                     return error_response(
                         &id,
                         &format!(
-                            "cannot read the session tab binding to update the pin state: {} \
-                             — delete the file to reset the session's tab binding",
+                            "cannot read the session tab binding to update the pin state: {}. \
+                             Delete the binding file to reset the session.",
                             e
                         ),
                     );
                 }
             }
-            // Force write-on-change to re-persist from the live snapshot.
+            // Persistence succeeded (or there was nothing to write): commit the
+            // live state, and force a re-persist from the snapshot next time.
+            state.pin_tab = pin;
+            if let Some(ref mut mgr) = state.browser {
+                mgr.set_pin_tab(pin);
+            }
             state.last_persisted_binding = None;
         }
         _ => {}
