@@ -1007,10 +1007,10 @@ impl DaemonState {
                     // event is ever drained, so this branch never runs for
                     // agent-initiated tabs. `register_discovered_page` is the
                     // single decision point shared with the
-                    // `Target.targetCreated` handler below (~line 1082):
-                    // never activate an event-discovered target, since that
-                    // would steal the agent's active tab and, under
-                    // pin-tab, overwrite the persisted binding.
+                    // `Target.targetCreated` handler below: a pinned session
+                    // never activates a discovered target (that would steal
+                    // the active tab and overwrite its binding); a legacy
+                    // session follows it.
                     mgr.register_discovered_page(
                         &target_info.target_id,
                         page_sid,
@@ -1137,12 +1137,11 @@ impl DaemonState {
                     // Event-discovered target (e.g. a tab the human opened in the
                     // shared Chrome, or a JS-opened popup): register it via the
                     // same `register_discovered_page` decision point used by the
-                    // `Target.attachedToTarget` handler above (~line 945), so it
-                    // shows in `tab list` but is never activated. Auto-activating
-                    // here is the active-tab steal, and under pin-tab it would
-                    // also overwrite the persisted binding. Explicit commands
-                    // (`tab new`, `window new`, `click --new-tab`) still activate
-                    // via their own paths.
+                    // `Target.attachedToTarget` handler above, which activates it
+                    // only for legacy sessions; a pinned session never adopts a
+                    // discovered tab (that steal would also overwrite its
+                    // binding). Explicit commands (`tab new`, `window new`,
+                    // `click --new-tab`) activate via their own paths.
                     mgr.register_discovered_page(
                         &te.target_info.target_id,
                         &attach.session_id,
