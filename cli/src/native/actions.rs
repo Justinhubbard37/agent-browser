@@ -2235,8 +2235,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                             return error_response(
                                 &id,
                                 &format!(
-                                    "cannot persist the pin-tab setting: {}. The change was \
-                                     not applied.",
+                                    "cannot persist the pin-tab setting: {} — the change was \
+                                     not applied",
                                     e
                                 ),
                             );
@@ -2248,8 +2248,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                     return error_response(
                         &id,
                         &format!(
-                            "cannot read the session tab binding to update the pin state: {}. \
-                             Delete the binding file to reset the session.",
+                            "cannot read the session tab binding to update the pin state: {} \
+                             — delete the binding file to reset the session",
                             e
                         ),
                     );
