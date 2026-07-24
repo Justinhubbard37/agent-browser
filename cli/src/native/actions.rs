@@ -2170,12 +2170,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             if let Some(ref mut mgr) = state.browser {
                 mgr.set_pin_tab(pin);
             }
-            // Rewrite the persisted pinned state immediately: relying on the
-            // next browser-touching command would lose the change if the
-            // daemon restarts first (there may be no browser at all, e.g.
-            // when disabling a pin to recover a stuck session). A load/save
-            // error here must fail loudly, not report success and silently
-            // restore the old state after restart.
+            // Persist the pinned state now, not on the next command, so a
+            // restart can't drop it. A load/save error fails the toggle
+            // rather than reporting a success that won't survive a restart.
             match tab_binding::load(&state.session_id) {
                 Ok(Some(mut binding)) => {
                     if binding.pinned != pin {

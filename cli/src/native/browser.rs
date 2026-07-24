@@ -886,14 +886,10 @@ impl BrowserManager {
     // Session-to-tab binding
     // -----------------------------------------------------------------------
 
-    /// Enable or disable strict pin-tab semantics for this session.
-    /// Enabling binds the currently active tab immediately, so a session that
-    /// turns pinning on at runtime enforces on the live tab instead of leaving
-    /// `bound_target_id` unset until a restart re-derives it from the persisted
-    /// snapshot (the "pinning applied too late / without binding" gap).
-    /// Disabling clears a pending `tab_gone` state (which only exists under pin
-    /// semantics) so the session falls back to legacy selection instead of
-    /// staying stuck on errors for a pin it no longer has.
+    /// Enable or disable strict pin-tab semantics. Enabling binds the active
+    /// tab now, so a runtime toggle enforces on the live tab rather than
+    /// waiting for a restart to re-derive it. Disabling clears any pending
+    /// `tab_gone` state so the session falls back to legacy selection.
     pub fn set_pin_tab(&mut self, pin: bool) {
         self.pin_tab = pin;
         if pin {
@@ -1505,9 +1501,7 @@ impl BrowserManager {
             })?;
         self.enable_domains(&session_id).await?;
         self.active_page_index = index;
-        // An explicit tab switch re-binds the session (and clears any
-        // tab_gone state), so a pinned session follows the tab the agent
-        // deliberately moved to.
+        // An explicit switch re-binds the session and clears any tab_gone.
         self.bind_active_target();
 
         // Bring tab to front
@@ -1928,12 +1922,9 @@ impl BrowserManager {
 
     fn add_page_with_activation(&mut self, page: PageInfo, activate: bool) {
         let new_index = self.pages.len();
-        // A pinned session whose bound tab is gone must not silently adopt a
-        // discovered (non-activated) tab: activating it here would clear the
-        // `tab_gone` state and re-bind the session to a tab it never opened,
-        // exactly the hijack `tab_gone` exists to prevent. The empty-pages
-        // branch of the activation policy would otherwise force this. Recovery
-        // stays explicit (`tab new` / `tab <ref>` pass `activate = true`).
+        // In the tab_gone state, adopting a discovered tab would clear it and
+        // re-bind to a tab the session never opened. Recovery stays explicit
+        // (`tab new` / `tab <ref>` pass `activate = true`).
         if !activate && self.pin_tab && self.bound_target_gone.is_some() {
             self.pages.push(page);
             return;
@@ -1980,21 +1971,13 @@ impl BrowserManager {
         self.pages.iter().any(|p| p.target_id == target_id)
     }
 
-    /// Single decision point for both CDP-event-discovered target drains
-    /// (`Target.attachedToTarget` and `Target.targetCreated` handlers in
-    /// actions.rs). If the target is already tracked, only its metadata is
-    /// refreshed in place. Otherwise a new page is appended, and activation
-    /// depends on the pin mode: a pinned session never lets an
-    /// event-discovered target (a tab the human opened in the shared Chrome,
-    /// or a JS-opened popup) steal the active tab or overwrite the pin
-    /// binding, while a legacy (non-pin) session keeps following the newest
-    /// tab so downstream scoping (e.g. a11y frame sessions) tracks it.
-    /// Explicit agent commands (`tab new`, `window new`, `click --new-tab`)
-    /// register their own page via `add_page` on their own path and never go
-    /// through this function. Both drain handlers call this one function so
-    /// the activation policy can't diverge between them; a regression here
-    /// breaks both handlers at once and is caught by
-    /// `test_register_discovered_page_*` below.
+    /// Single decision point for both CDP target drains
+    /// (`Target.attachedToTarget` and `Target.targetCreated`). A tracked
+    /// target only has its metadata refreshed; a new one is appended and
+    /// activated per pin mode: a pinned session never lets a discovered tab
+    /// steal the active tab or pin binding, a legacy session follows it.
+    /// Explicit commands (`tab new`, `window new`, `click --new-tab`) take
+    /// their own `add_page` path. Covered by `test_register_discovered_page_*`.
     pub fn register_discovered_page(
         &mut self,
         target_id: &str,
@@ -3058,11 +3041,9 @@ mod tests {
     /// call is reverted from `add_page_without_activation` to `add_page`, this
     /// test fails, and BOTH actions.rs call sites are broken simultaneously
     /// since there is no other path to diverge through.
-    /// A legacy (non-pin) session must keep following an event-discovered tab:
-    /// the no-steal rule is scoped to pinned sessions, so downstream scoping
-    /// (a11y frame sessions) still tracks a popup. Force-red: unconditionally
-    /// register discovered pages without activation and the active tab stays on
-    /// TARGET_A here.
+    /// A legacy (non-pin) session follows an event-discovered tab; no-steal is
+    /// scoped to pinned sessions. Force-red: register without activation and
+    /// the active tab stays on TARGET_A.
     #[tokio::test]
     async fn test_register_discovered_page_activates_for_non_pin_session() {
         let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
@@ -3121,11 +3102,9 @@ mod tests {
         );
     }
 
-    /// Enabling pin at runtime must bind the currently active tab immediately.
-    /// The attach-to-existing path leaves `bound_target_id` unset, so a session
-    /// that turns `--pin-tab` on later would otherwise be pinned-but-unbound
-    /// until a restart re-derived the binding from disk. Force-red: revert
-    /// `set_pin_tab` to only flip the flag and `bound_target_id` stays `None`.
+    /// Enabling pin binds the active tab immediately (attach-to-existing leaves
+    /// `bound_target_id` unset). Force-red: make `set_pin_tab` only flip the
+    /// flag and `bound_target_id` stays `None`.
     #[tokio::test]
     async fn test_enabling_pin_binds_active_tab_immediately() {
         let mut mgr = test_manager(vec![
@@ -3153,15 +3132,10 @@ mod tests {
         );
     }
 
-    /// A pinned session whose only tracked tab is closed enters the
-    /// `tab_gone` state; a subsequently discovered (auto-attached,
-    /// non-activated) tab must NOT silently re-bind the session and clear
-    /// `tab_gone`. Before the fix, `add_page_with_activation`'s empty-pages
-    /// branch forced activation and `bind_active_target` cleared
-    /// `bound_target_gone`, hijacking the session onto a tab it never opened.
+    /// Once a pinned session is in the `tab_gone` state, a discovered
+    /// (non-activated) tab must not clear it and re-bind the session.
     /// Force-red: drop the `pin_tab && bound_target_gone` guard in
-    /// `add_page_with_activation` and `active_target_id` becomes `Ok` /
-    /// `bound_target_is_gone` becomes false here.
+    /// `add_page_with_activation` and `active_target_id` becomes `Ok` here.
     #[tokio::test]
     async fn test_discovered_tab_does_not_recover_gone_pinned_session() {
         let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
