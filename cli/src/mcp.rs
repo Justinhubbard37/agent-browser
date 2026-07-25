@@ -2,7 +2,9 @@
 //!
 //! The server keeps stdout exclusively for newline-delimited JSON-RPC
 //! messages. Tool calls are delegated to the current binary in `--json` mode
-//! so MCP behavior stays aligned with the normal CLI command surface.
+//! so MCP behavior stays aligned with the normal CLI command surface. Daemon
+//! lifecycle settings, including the default idle timeout, use the same CLI
+//! parser and daemon as direct commands.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
@@ -140,6 +142,7 @@ const TOOL_REACT_RENDERS_START: &str = "agent_browser_react_renders_start";
 const TOOL_REACT_RENDERS_STOP: &str = "agent_browser_react_renders_stop";
 const TOOL_REACT_SUSPENSE: &str = "agent_browser_react_suspense";
 const TOOL_VITALS: &str = "agent_browser_vitals";
+const TOOL_A11Y: &str = "agent_browser_a11y";
 const TOOL_PUSHSTATE: &str = "agent_browser_pushstate";
 const TOOL_REMOVE_INIT_SCRIPT: &str = "agent_browser_remove_init_script";
 const TOOL_CONFIRM: &str = "agent_browser_confirm";
@@ -253,7 +256,7 @@ impl ToolProfile {
             Self::Core => "Everyday browser automation with navigation, snapshots, common interaction, waits, screenshots, basic reads, tab basics, JavaScript eval, close, and profile discovery.",
             Self::Network => "Network interception, request inspection, HAR capture, headers, credentials, and offline mode.",
             Self::State => "Cookies, storage, auth profiles, saved browser state, sessions, Chrome profiles, and bundled skills.",
-            Self::Debug => "Console/errors, highlighting, DevTools, tracing, profiling, PDF, downloads/uploads, recording, clipboard, plugin registry and plugin command.run, doctor, dashboard, install, upgrade, and chat.",
+            Self::Debug => "Console/errors, highlighting, DevTools, tracing, profiling, accessibility audits, PDF, downloads/uploads, recording, clipboard, plugin registry and plugin command.run, doctor, dashboard, install, upgrade, and chat.",
             Self::Tabs => "Tab, window, frame, and JavaScript dialog management.",
             Self::React => "React tree inspection, render recording, Suspense inspection, Web Vitals, SPA pushstate, and init-script removal.",
             Self::Mobile => "Viewport/device/geolocation/media emulation plus touch, swipe, and lower-level mouse tools.",
@@ -408,6 +411,7 @@ const DEBUG_PROFILE_TOOLS: &[&str] = &[
     TOOL_RECORD_START,
     TOOL_RECORD_STOP,
     TOOL_RECORD_RESTART,
+    TOOL_A11Y,
     TOOL_CONSOLE,
     TOOL_ERRORS,
     TOOL_HIGHLIGHT,
@@ -1035,11 +1039,11 @@ fn parity_tools() -> Vec<Value> {
             json!({
                 "locator": { "type": "string", "enum": ["role", "text", "label", "placeholder", "alt", "title", "testid", "first", "last", "nth"] },
                 "value": { "type": "string", "description": "Role, text, label, selector, or test id." },
-                "action": { "type": "string", "description": "Optional action: click, fill, type, hover, focus, check, uncheck, text." },
-                "text": { "type": "string", "description": "Optional text/value for fill or type actions." },
+                "action": { "type": "string", "description": "Optional action: click, fill, check, hover, text." },
+                "text": { "type": "string", "description": "Optional value for the fill action." },
                 "index": { "type": "integer", "description": "Index for nth locator." },
                 "name": { "type": "string", "description": "Accessible name filter for role locator." },
-                "exact": { "type": "boolean", "default": false }
+                "exact": { "type": "boolean", "description": "Exact, case-sensitive match. For the role locator it applies to the accessible name, whose default is a case-insensitive substring. The role value itself always matches case-insensitively, with or without exact.", "default": false }
             }),
             &["locator", "value"],
         ),
@@ -1564,6 +1568,18 @@ fn parity_tools() -> Vec<Value> {
             &[],
         ),
         tool(
+            TOOL_A11Y,
+            "Accessibility audit",
+            "Run an axe-core accessibility audit and report WCAG violations, optionally navigating to a URL first.",
+            json!({
+                "url": { "type": "string" },
+                "tags": { "type": "string" },
+                "selector": { "type": "string" },
+                "json": { "type": "boolean" }
+            }),
+            &[],
+        ),
+        tool(
             TOOL_PUSHSTATE,
             "Push state",
             "Perform SPA client-side navigation.",
@@ -1882,6 +1898,13 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         }),
     );
     props.insert(
+        "idleTimeout".to_string(),
+        json!({
+            "type": "string",
+            "description": "Daemon idle timeout such as 30s, 5m, 1h, or raw milliseconds. Defaults to 1h; 0 disables idle shutdown."
+        }),
+    );
+    props.insert(
         "extraArgs".to_string(),
         json!({
             "type": "array",
@@ -2192,6 +2215,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_REACT_RENDERS_STOP => call_react_renders_stop(arguments),
         TOOL_REACT_SUSPENSE => call_react_suspense(arguments),
         TOOL_VITALS => call_vitals(arguments),
+        TOOL_A11Y => call_a11y(arguments),
         TOOL_PUSHSTATE => call_one_string(arguments, "pushstate", "url"),
         TOOL_REMOVE_INIT_SCRIPT => call_one_string(arguments, "removeinitscript", "id"),
         TOOL_CONFIRM => call_one_string(arguments, "confirm", "id"),
@@ -3167,6 +3191,25 @@ fn call_vitals(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
+fn call_a11y(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec!["a11y".to_string()];
+    if let Some(url) = optional_string(arguments, "url")? {
+        args.push(url);
+    }
+    if let Some(tags) = optional_string(arguments, "tags")? {
+        args.push("--tags".to_string());
+        args.push(tags);
+    }
+    if let Some(selector) = optional_string(arguments, "selector")? {
+        args.push("--selector".to_string());
+        args.push(selector);
+    }
+    if optional_bool(arguments, "json")?.unwrap_or(false) {
+        args.push("--json".to_string());
+    }
+    call_cli_tool(arguments, args, None)
+}
+
 fn call_stream_enable(arguments: &Value) -> Result<Value, ProtocolError> {
     let mut args = vec!["stream".to_string(), "enable".to_string()];
     if let Some(port) = optional_u64(arguments, "port")? {
@@ -3483,6 +3526,11 @@ fn append_common_global_args(
     }
     append_session_args(args, session);
 
+    if let Some(idle_timeout) = optional_string(arguments, "idleTimeout")? {
+        args.push("--idle-timeout".to_string());
+        args.push(idle_timeout);
+    }
+
     if let Some(restore) = arguments.get("restore") {
         if let Some(enabled) = restore.as_bool() {
             if enabled {
@@ -3680,6 +3728,17 @@ fn response_text(value: &Value) -> Option<String> {
         }
 
         if let Some(data) = obj.get("data") {
+            // Accessibility reports carry a URL alongside their findings. Use
+            // the same report formatter as the CLI before the generic string
+            // field fallback turns the MCP text content into only that URL.
+            if data.get("axeVersion").is_some()
+                && data
+                    .get("violations")
+                    .and_then(|value| value.as_array())
+                    .is_some()
+            {
+                return Some(crate::output::format_a11y_text(data));
+            }
             for key in [
                 "snapshot", "text", "html", "report", "value", "content", "title", "url", "path",
             ] {
@@ -3965,6 +4024,17 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("agent-browser mcp --tools all"));
+        let debug_profile = result["structuredContent"]["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|profile| profile["name"] == "debug")
+            .unwrap();
+        assert!(debug_profile["description"]
+            .as_str()
+            .unwrap()
+            .contains("accessibility audits"));
+        assert!(McpConfig::from_profiles(vec![ToolProfile::Debug]).allows(TOOL_A11Y));
     }
 
     #[test]
@@ -3979,6 +4049,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(text, "# Docs\n\nReadable content.");
+    }
+
+    #[test]
+    fn response_text_formats_a11y_findings_before_url_metadata() {
+        let text = response_text(&json!({
+            "success": true,
+            "data": {
+                "url": "https://example.com",
+                "axeVersion": "4.12.1",
+                "counts": {
+                    "violations": 1,
+                    "incomplete": 0,
+                    "passes": 12,
+                    "inapplicable": 20
+                },
+                "violations": [{
+                    "id": "image-alt",
+                    "impact": "critical",
+                    "help": "Images must have alternative text",
+                    "nodeCount": 1,
+                    "nodes": [{ "target": ["#hero"] }]
+                }],
+                "incomplete": []
+            }
+        }))
+        .unwrap();
+
+        assert!(text.contains("violations: 1"));
+        assert!(text.contains("[critical] image-alt"));
+        assert!(text.contains("  - #hero"));
+        assert_ne!(text, "https://example.com");
     }
 
     #[test]
@@ -4093,6 +4194,22 @@ mod tests {
     }
 
     #[test]
+    fn common_global_args_include_idle_timeout() {
+        let mut args = Vec::new();
+
+        append_common_global_args(
+            &mut args,
+            &json!({
+                "idleTimeout": "0"
+            }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(args, vec!["--idle-timeout", "0"]);
+    }
+
+    #[test]
     fn tool_schema_includes_extra_args_for_cli_parity() {
         let tools = tools();
         let open = tools
@@ -4114,6 +4231,10 @@ mod tests {
         assert_eq!(
             open["inputSchema"]["properties"]["allowedDomains"]["type"],
             "array"
+        );
+        assert_eq!(
+            open["inputSchema"]["properties"]["idleTimeout"]["type"],
+            "string"
         );
     }
 
@@ -4146,6 +4267,10 @@ mod tests {
             .iter()
             .find(|t| t["name"].as_str() == Some(TOOL_READ))
             .unwrap();
+        let a11y = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some(TOOL_A11Y))
+            .unwrap();
         let skills_get = tools
             .iter()
             .find(|t| t["name"].as_str() == Some(TOOL_SKILLS_GET))
@@ -4154,6 +4279,7 @@ mod tests {
         assert_eq!(open["annotations"]["readOnlyHint"], false);
         assert_eq!(open["annotations"]["openWorldHint"], true);
         assert_eq!(read["annotations"]["readOnlyHint"], true);
+        assert_eq!(a11y["annotations"]["readOnlyHint"], false);
         assert_eq!(read["annotations"]["openWorldHint"], true);
         assert_eq!(get_url["annotations"]["readOnlyHint"], true);
         assert_eq!(get_url["annotations"]["openWorldHint"], true);

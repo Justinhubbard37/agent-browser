@@ -103,7 +103,7 @@ A client can cap its own frame rate by sending a `config` message at any time:
 
 ## Input injection
 
-Send input events to control the browser remotely.
+Send input events to control the browser remotely. Mouse, keyboard, and touch input reset the daemon idle timer, so an actively controlled dashboard or streaming session is not shut down by the default timeout.
 
 ### Mouse events
 
