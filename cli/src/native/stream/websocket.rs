@@ -391,11 +391,13 @@ async fn reader_loop(
                     }
                     continue;
                 }
-                if is_user_input_message_type(msg_type) {
-                    idle_activity.mark();
-                }
                 let guard = client_slot.read().await;
                 if let Some(ref client) = *guard {
+                    // Marked here, not before the guard, so the idle clock keeps
+                    // the pre-merge meaning: input that reaches CDP is activity.
+                    if is_user_input_message_type(msg_type) {
+                        idle_activity.mark();
+                    }
                     let sid = cdp_session_id.read().await;
                     dispatch_input(msg_type, &parsed, client.as_ref(), sid.as_deref()).await;
                 }
