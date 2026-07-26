@@ -754,6 +754,18 @@ impl BrowserManager {
         self.enable_domains(session_id).await
     }
 
+    /// Revive the active tab if the browser discarded it (Memory Saver), then
+    /// enable CDP domains on it. The pin-tab restore path re-selects a
+    /// persisted tab that may be discarded; enabling domains on it directly
+    /// hangs on `Page.enable`, so revive first (the path tab switch uses).
+    pub async fn revive_and_enable_active(&self) -> Result<(), String> {
+        let session_id = self.active_session_id()?.to_string();
+        let target_id = self.active_target_id()?.to_string();
+        self.ensure_renderer_alive(&session_id, &target_id, None)
+            .await?;
+        self.enable_domains(&session_id).await
+    }
+
     pub async fn prepare_domains_pub(&self, session_id: &str) -> Result<(), String> {
         self.prepare_domains(session_id).await
     }
@@ -1326,6 +1338,12 @@ impl BrowserManager {
     /// about:blank page and attaches to it.
     pub async fn ensure_page(&mut self) -> Result<(), String> {
         if !self.pages.is_empty() {
+            return Ok(());
+        }
+        // A pinned session in the tab_gone state must not get a fresh blank
+        // tab: creating one binds it and clears tab_gone, silently recovering
+        // onto a blank page. Recovery stays explicit (tab new / tab <ref>).
+        if self.pin_tab && self.bound_target_gone.is_some() {
             return Ok(());
         }
 
@@ -3116,6 +3134,32 @@ mod tests {
     /// call is reverted from `add_page_without_activation` to `add_page`, this
     /// test fails, and BOTH actions.rs call sites are broken simultaneously
     /// since there is no other path to diverge through.
+    /// A pinned session whose sole tab closed (page list empty, tab_gone) must
+    /// not have `ensure_page` silently create+bind a blank tab, which would
+    /// clear tab_gone. Force-red: drop the pin_tab+gone guard in ensure_page
+    /// and this either creates a tab (page_count 1) or hangs on the create.
+    #[tokio::test]
+    async fn test_ensure_page_skips_creation_for_gone_pinned_session() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_pin_tab(true);
+        assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
+        mgr.remove_page_by_target_id(TARGET_A);
+        assert!(mgr.bound_target_is_gone());
+        assert_eq!(mgr.page_count(), 0);
+
+        mgr.ensure_page().await.unwrap();
+
+        assert_eq!(
+            mgr.page_count(),
+            0,
+            "must not auto-create a tab while a pin is in the tab_gone state"
+        );
+        assert!(
+            mgr.bound_target_is_gone(),
+            "ensure_page must not clear tab_gone"
+        );
+    }
+
     /// A legacy (non-pin) session follows an event-discovered tab; no-steal is
     /// scoped to pinned sessions. Force-red: register without activation and
     /// the active tab stays on TARGET_A.

@@ -2381,6 +2381,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
 
         if let Some(ref mut mgr) = state.browser {
             if mgr.page_count() == 0 {
+                // ensure_page itself skips creation for a pinned tab_gone
+                // session, so a closed sole tab stays tab_gone instead of
+                // silently recovering onto a fresh blank page.
                 let _ = mgr.ensure_page().await;
             }
         }
@@ -2796,12 +2799,13 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
                 .map(|mgr| mgr.restore_target_binding(&b.target_id, &b.url))
                 .unwrap_or(false);
             if restored {
-                // Attach only enables the CDP domains on the first target;
-                // the restored tab needs them too (like tab_switch), or
-                // lifecycle-dependent commands such as navigate hang.
+                // Attach only enables the CDP domains on the first target; the
+                // restored tab needs them too (like tab_switch), or
+                // lifecycle-dependent commands such as navigate hang. The tab
+                // may have been discarded by Memory Saver, so revive it before
+                // enabling domains instead of hanging on Page.enable.
                 if let Some(ref mgr) = state.browser {
-                    let session_id = mgr.active_session_id()?.to_string();
-                    mgr.enable_domains_pub(&session_id).await?;
+                    mgr.revive_and_enable_active().await?;
                 }
             }
             if restored || pin {
@@ -2844,6 +2848,21 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
         }
     }
     Ok(established)
+}
+
+/// Run `apply_tab_binding_on_attach`, but tear the connection down on failure.
+/// The attach paths set `state.browser` before calling this; without the
+/// rollback a binding-recovery error would leave a live but un-recovered
+/// browser, and the next command would skip the attach path and act on the
+/// wrong tab.
+async fn apply_tab_binding_on_attach_or_rollback(state: &mut DaemonState) -> Result<bool, String> {
+    match apply_tab_binding_on_attach(state).await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let _ = close_current_browser(state).await;
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3350,7 +3369,7 @@ async fn auto_launch(
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
-        apply_tab_binding_on_attach(state).await?;
+        apply_tab_binding_on_attach_or_rollback(state).await?;
         state.update_stream_client().await;
         install_network_controls_or_close(state, has_proxy_auth).await?;
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
@@ -3383,7 +3402,7 @@ async fn auto_launch(
         );
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_auto().await?);
-        if !apply_tab_binding_on_attach(state).await? {
+        if !apply_tab_binding_on_attach_or_rollback(state).await? {
             open_fresh_tab_for_auto_connect(state).await?;
         }
         state.launch_hash = Some(hash);
@@ -4265,7 +4284,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
-        apply_tab_binding_on_attach(state).await?;
+        apply_tab_binding_on_attach_or_rollback(state).await?;
         state.update_stream_client().await;
         install_network_controls_or_close(state, has_proxy_auth).await?;
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
@@ -4281,7 +4300,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
-        apply_tab_binding_on_attach(state).await?;
+        apply_tab_binding_on_attach_or_rollback(state).await?;
         state.update_stream_client().await;
         install_network_controls_or_close(state, has_proxy_auth).await?;
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
@@ -4293,7 +4312,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     if auto_connect {
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_auto().await?);
-        if !apply_tab_binding_on_attach(state).await? {
+        if !apply_tab_binding_on_attach_or_rollback(state).await? {
             open_fresh_tab_for_auto_connect(state).await?;
         }
         state.launch_hash = Some(new_hash);
