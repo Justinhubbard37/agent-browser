@@ -224,6 +224,22 @@ async fn handle_ws_client(
 
     let (mut ws_tx, ws_rx) = ws_stream.split();
 
+    // 0 means uncapped; set by the client via {"type":"config","maxFps":N}.
+    // A watch channel (not an atomic) so a mid-stream config change wakes the
+    // writer's select! below, letting it re-derive its throttle deadline
+    // immediately instead of riding out a stale one computed from the old rate.
+    let (max_fps_tx, mut max_fps_rx) = watch::channel::<u32>(0);
+    // Spawned before the status, tabs, and seed-frame writes below: those are
+    // three unbounded sends, and a client whose receive queue is already full
+    // would otherwise hold input hostage for the whole handshake.
+    let mut reader_task = tokio::spawn(reader_loop(
+        ws_rx,
+        client_slot.clone(),
+        cdp_session_id.clone(),
+        max_fps_tx,
+        idle_activity.clone(),
+    ));
+
     {
         let guard = client_slot.read().await;
         let connected = guard.is_some();
@@ -262,19 +278,6 @@ async fn handle_ws_client(
     }
 
     client_notify.notify_one();
-
-    // 0 means uncapped; set by the client via {"type":"config","maxFps":N}.
-    // A watch channel (not an atomic) so a mid-stream config change wakes the
-    // writer's select! below, letting it re-derive its throttle deadline
-    // immediately instead of riding out a stale one computed from the old rate.
-    let (max_fps_tx, mut max_fps_rx) = watch::channel::<u32>(0);
-    let mut reader_task = tokio::spawn(reader_loop(
-        ws_rx,
-        client_slot.clone(),
-        cdp_session_id.clone(),
-        max_fps_tx,
-        idle_activity.clone(),
-    ));
 
     // The throttle deadline is always derived from the last send plus the
     // current interval, so a config change recomputes it against `last_sent`

@@ -1493,7 +1493,7 @@ Connect to `ws://localhost:9223` to receive frames and send input:
 }
 ```
 
-Frames are delivered latest-first: a client that falls behind skips stale frames and always receives the newest one. `maxFps` (1 to 120, `0` = uncapped) limits delivery for that client only. Input events are read on a dedicated task per connection, so clicks and keystrokes dispatch immediately even while frames are mid-write to a slow client.
+Frames are delivered latest-first: the server picks the newest frame at send time, so frames produced while an earlier one is still being written are skipped rather than queued. Frames already handed to the socket stay in the transport buffer, so a client that stops reading entirely still drains what the kernel accepted before the writer blocked; `maxFps` bounds how much that can be. `maxFps` (1 to 120, `0` = uncapped) limits delivery for that client only. Input events are read on a dedicated task per connection, so clicks and keystrokes dispatch immediately even while frames are mid-write to a slow client.
 
 ## Architecture
 

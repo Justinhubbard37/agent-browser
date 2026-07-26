@@ -3032,8 +3032,10 @@ available localhost port automatically and reports it back.
 Notes:
   - 'stream enable' creates the WebSocket server.
   - WebSocket clients trigger frame streaming automatically.
-  - Frames are delivered latest-first: clients that fall behind skip stale
-    frames instead of draining a backlog. Input events dispatch immediately,
+  - Frames are delivered latest-first: the newest frame is picked at send
+    time, so frames produced during an in-flight write are skipped, never
+    queued. Frames already written stay in the transport buffer; maxFps
+    bounds how many that can be. Input events dispatch immediately,
     independent of frame delivery.
   - Clients can cap their own frame rate by sending
     {"type":"config","maxFps":N} (1-120, 0 = uncapped, per client).
