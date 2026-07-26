@@ -8,6 +8,20 @@ use crate::native::network;
 
 use super::timestamp_ms;
 
+/// Capture time of a screencast frame, in epoch milliseconds.
+///
+/// CDP sends `Network.TimeSinceEpoch`, a float in seconds. Reading it as an
+/// integer therefore always failed and every frame went out stamped 0, which
+/// left clients unable to tell how stale a frame was. Milliseconds match the
+/// other timestamps in this protocol.
+fn frame_timestamp_ms(meta: Option<&Value>) -> u64 {
+    meta.and_then(|m| m.get("timestamp"))
+        .and_then(|v| v.as_f64())
+        .filter(|s| *s > 0.0)
+        .map(|s| (s * 1000.0) as u64)
+        .unwrap_or(0)
+}
+
 /// Background task that subscribes to CDP events and broadcasts screencast frames in real-time.
 /// Also handles auto-start/stop of screencast based on WebSocket client count.
 /// Frames go through `frame_watch` (latest value wins) while every other
@@ -154,6 +168,7 @@ pub(super) async fn cdp_event_loop(
                                             let meta = evt.params.get("metadata");
                                             let msg = json!({
                                                 "type": "frame",
+                                                "seq": super::next_frame_seq(),
                                                 "data": data,
                                                 "metadata": {
                                                     "offsetTop": meta.and_then(|m| m.get("offsetTop")).and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -162,7 +177,7 @@ pub(super) async fn cdp_event_loop(
                                                     "deviceHeight": vh,
                                                     "scrollOffsetX": meta.and_then(|m| m.get("scrollOffsetX")).and_then(|v| v.as_f64()).unwrap_or(0.0),
                                                     "scrollOffsetY": meta.and_then(|m| m.get("scrollOffsetY")).and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                                    "timestamp": meta.and_then(|m| m.get("timestamp")).and_then(|v| v.as_u64()).unwrap_or(0),
+                                                    "timestamp": frame_timestamp_ms(meta),
                                                 }
                                             });
                                             frame_watch.send_replace(Some(Arc::new(msg.to_string())));
@@ -319,4 +334,26 @@ pub async fn ack_screencast_frame(
         )
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard: CDP sends the capture time as a float in seconds, so
+    /// reading it as an integer silently stamped every frame 0 and no client
+    /// could measure frame age.
+    #[test]
+    fn test_frame_timestamp_converts_cdp_seconds_to_millis() {
+        let meta = json!({ "timestamp": 1785038682.238_f64 });
+        assert_eq!(frame_timestamp_ms(Some(&meta)), 1785038682238);
+    }
+
+    #[test]
+    fn test_frame_timestamp_absent_or_zero_stays_zero() {
+        assert_eq!(frame_timestamp_ms(None), 0);
+        assert_eq!(frame_timestamp_ms(Some(&json!({}))), 0);
+        assert_eq!(frame_timestamp_ms(Some(&json!({ "timestamp": 0 }))), 0);
+        assert_eq!(frame_timestamp_ms(Some(&json!({ "timestamp": "nope" }))), 0);
+    }
 }

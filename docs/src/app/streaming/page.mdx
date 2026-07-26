@@ -56,6 +56,7 @@ The server sends frame messages with base64-encoded images:
 ```json
 {
   "type": "frame",
+  "seq": 41,
   "data": "<base64-encoded-jpeg>",
   "metadata": {
     "deviceWidth": 1280,
@@ -63,10 +64,15 @@ The server sends frame messages with base64-encoded images:
     "pageScaleFactor": 1,
     "offsetTop": 0,
     "scrollOffsetX": 0,
-    "scrollOffsetY": 0
+    "scrollOffsetY": 0,
+    "timestamp": 1785038682238
   }
 }
 ```
+
+`seq` is a monotonic frame id. It is what an ack pacing client echoes back, and it keeps climbing across browser relaunches so a long-lived client never sees an id go backwards.
+
+`metadata.timestamp` is the capture time in epoch milliseconds. Comparing it against the clock when the frame is drawn gives the age of what is on screen, which is the number worth watching on a constrained link.
 
 ### Status messages
 
@@ -84,7 +90,9 @@ Connection and screencast status:
 
 ### Frame delivery
 
-Frames are delivered latest-first: the server holds only the newest frame and reads it at send time, so every frame produced while an earlier one is still being written is skipped instead of queued. The application never builds a backlog. The transport underneath still can: frames already accepted by the socket are delivered in order, so a client that stops reading entirely drains whatever the kernel buffered before the writer blocked. Setting `maxFps` bounds that window, since the server only produces frames for this client at the requested rate. Status, console, and tab messages flow through a separate ordered channel and are not subject to frame dropping.
+Frames are delivered latest-first: the server holds only the newest frame and reads it at send time, so every frame produced while an earlier one is still being written is skipped instead of queued. The application never builds a backlog.
+
+In the default push pacing the transport underneath still can: frames already accepted by the socket are delivered in order, so a client that stops reading entirely drains whatever the kernel buffered before the writer blocked. Ack pacing removes that window (see below). Status, console, and tab messages flow through a separate ordered channel and are not subject to frame dropping.
 
 Input handling is independent of frame delivery. Each connection reads input on its own task, so clicks and keystrokes dispatch to the browser immediately even while a large frame is mid-write to a slow client.
 
@@ -99,7 +107,33 @@ A client can cap its own frame rate by sending a `config` message at any time:
 }
 ```
 
-`maxFps` caps how many frames per second the server sends to this client (1 to 120). Set `0` to remove the cap (the default). Each client controls its own rate; other connected clients are unaffected. Combined with latest-first delivery, a preview on a constrained link can request a low rate and stay close to the current state of the page: the lower the rate, the less the transport can buffer behind a reader that stalls.
+`maxFps` caps how many frames per second the server sends to this client (1 to 120). Set `0` to remove the cap (the default). Each client controls its own rate; other connected clients are unaffected.
+
+### Ack pacing
+
+Push pacing hands each frame to the socket as soon as the rate allows, so a client that stalls drains what the transport buffered. To get one frame at a time instead, opt into ack pacing:
+
+```json
+{
+  "type": "config",
+  "pacing": "ack"
+}
+```
+
+The server then keeps at most one frame in flight and waits for the client to acknowledge it:
+
+```json
+{
+  "type": "ack",
+  "seq": 41
+}
+```
+
+Every `frame` message carries a monotonic `seq`. Echo the id of the frame you finished rendering. While an ack is outstanding, newer frames replace each other in the server and never reach the socket, so a client that stalls for ten seconds and resumes receives the current page rather than ten seconds of history. This mirrors how Chrome paces its own screencast upstream with `Page.screencastFrameAck`.
+
+Acks are cumulative: acknowledging a newer id covers every older one, so a client that skips ids still unblocks delivery. A client that opts in and then stops acknowledging simply stops receiving frames, while status, tabs, url, and console keep flowing. Send `{"type":"config","pacing":"push"}` to return to the default.
+
+`pacing` and `maxFps` are independent and compose: pacing bounds how much is in flight, `maxFps` bounds the rate. A preview on a constrained link usually wants both.
 
 ## Input injection
 

@@ -17,6 +17,18 @@ use tokio::sync::{broadcast, watch, Mutex, Notify, RwLock};
 
 use super::cdp::client::CdpClient;
 
+/// Frame ids are process-wide, not per stream server.
+///
+/// A client in ack pacing tracks the newest id it has acknowledged. If ids
+/// restarted whenever the CDP event loop did (a browser relaunch, a stream
+/// disable and enable), every id after the restart would look older than what
+/// that client already acknowledged, and its frames would stop for good.
+static FRAME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn next_frame_seq() -> u64 {
+    FRAME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 /// Shared activity clock for daemon commands and dashboard input.
 ///
 /// The timestamp lets the idle-shutdown path re-check activity after waiting
@@ -349,6 +361,7 @@ impl StreamServer {
     pub fn broadcast_screencast_frame(&self, base64_data: &str, metadata: &FrameMetadata) {
         let msg = json!({
             "type": "frame",
+            "seq": next_frame_seq(),
             "data": base64_data,
             "metadata": {
                 "offsetTop": metadata.offset_top,
@@ -615,6 +628,200 @@ mod tests {
         server.broadcast_frame(r#"{"type":"frame","data":"latest"}"#);
         let frame = next_frame(&mut ws).await;
         assert_eq!(frame.get("data").and_then(|v| v.as_str()), Some("latest"));
+
+        server.shutdown().await;
+    }
+
+    /// Assert no frame arrives within `ms`. Used to prove the writer is
+    /// holding rather than streaming; a plain `next_frame` would pass on the
+    /// very behavior these tests exist to forbid.
+    async fn expect_no_frame(ws: &mut WsClient, ms: u64) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match tokio::time::timeout(remaining, ws.next()).await {
+                Err(_) => return,
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let parsed: Value = serde_json::from_str(&text).expect("valid json");
+                    assert_ne!(
+                        parsed.get("type").and_then(|v| v.as_str()),
+                        Some("frame"),
+                        "frame delivered while the client owed an acknowledgement"
+                    );
+                }
+                Ok(_) => {}
+            }
+        }
+    }
+
+    /// Ack pacing keeps one frame in flight, and the frames produced while the
+    /// client owes an acknowledgement collapse to the newest one. Without this,
+    /// latest-frame-wins stops at the socket: everything already written is
+    /// delivered in order, so a client that stalls drains a stale backlog.
+    #[tokio::test]
+    async fn test_ack_pacing_holds_one_frame_and_skips_to_newest() {
+        let (server, _slot) = StreamServer::start_without_client(
+            0,
+            "t5".to_string(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .expect("server start");
+
+        let mut ws = connect_client(server.port()).await;
+        ws.send(Message::Text(
+            r#"{"type":"config","pacing":"ack"}"#.to_string(),
+        ))
+        .await
+        .expect("send config");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        server.broadcast_frame(r#"{"type":"frame","seq":1,"data":"one"}"#);
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.get("seq").and_then(|v| v.as_u64()), Some(1));
+
+        // Two more frames while frame 1 is unacknowledged: neither may be sent.
+        server.broadcast_frame(r#"{"type":"frame","seq":2,"data":"two"}"#);
+        server.broadcast_frame(r#"{"type":"frame","seq":3,"data":"three"}"#);
+        expect_no_frame(&mut ws, 300).await;
+
+        // Acknowledging releases exactly one frame, and it is the newest, not
+        // the next in order.
+        ws.send(Message::Text(r#"{"type":"ack","seq":1}"#.to_string()))
+            .await
+            .expect("send ack");
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.get("seq").and_then(|v| v.as_u64()), Some(3));
+
+        server.shutdown().await;
+    }
+
+    /// Returning to push pacing must release a frame that is still waiting on
+    /// an acknowledgement the client will now never send.
+    #[tokio::test]
+    async fn test_leaving_ack_pacing_releases_the_held_frame() {
+        let (server, _slot) = StreamServer::start_without_client(
+            0,
+            "t6".to_string(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .expect("server start");
+
+        let mut ws = connect_client(server.port()).await;
+        ws.send(Message::Text(
+            r#"{"type":"config","pacing":"ack"}"#.to_string(),
+        ))
+        .await
+        .expect("send config");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        server.broadcast_frame(r#"{"type":"frame","seq":1,"data":"one"}"#);
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.get("seq").and_then(|v| v.as_u64()), Some(1));
+
+        server.broadcast_frame(r#"{"type":"frame","seq":2,"data":"two"}"#);
+        expect_no_frame(&mut ws, 200).await;
+
+        ws.send(Message::Text(
+            r#"{"type":"config","pacing":"push"}"#.to_string(),
+        ))
+        .await
+        .expect("send config");
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.get("seq").and_then(|v| v.as_u64()), Some(2));
+
+        server.shutdown().await;
+    }
+
+    /// Frame ids must keep climbing across stream server restarts. Regression
+    /// guard: a per-server counter restarted at 1 on every browser relaunch,
+    /// and a client in ack pacing that had already acknowledged a higher id
+    /// would treat every later frame as older than its watermark, so its
+    /// stream stopped permanently.
+    #[tokio::test]
+    async fn test_frame_ids_survive_a_stream_server_restart() {
+        let meta = FrameMetadata::default();
+
+        let (first, _slot) = StreamServer::start_without_client(
+            0,
+            "t8".to_string(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .expect("server start");
+        let mut ws = connect_client(first.port()).await;
+        first.broadcast_screencast_frame("aaa", &meta);
+        let before = next_frame(&mut ws)
+            .await
+            .get("seq")
+            .and_then(|v| v.as_u64())
+            .expect("frame carries an id");
+        first.shutdown().await;
+
+        let (second, _slot2) = StreamServer::start_without_client(
+            0,
+            "t8b".to_string(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .expect("server restart");
+        let mut ws2 = connect_client(second.port()).await;
+        second.broadcast_screencast_frame("bbb", &meta);
+        let after = next_frame(&mut ws2)
+            .await
+            .get("seq")
+            .and_then(|v| v.as_u64())
+            .expect("frame carries an id");
+
+        assert!(
+            after > before,
+            "frame id went backwards across a restart: {} then {}",
+            before,
+            after
+        );
+
+        second.shutdown().await;
+    }
+
+    /// A config message must not deadlock the reader against its own watch
+    /// channel. Regression guard: reading the current settings directly in the
+    /// `if let` scrutinee kept the read guard alive across `send_replace`, and
+    /// the connection went silent from the first config message onward.
+    #[tokio::test]
+    async fn test_repeated_config_messages_keep_the_connection_live() {
+        let (server, _slot) = StreamServer::start_without_client(
+            0,
+            "t7".to_string(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .expect("server start");
+
+        let mut ws = connect_client(server.port()).await;
+        for msg in [
+            r#"{"type":"config","maxFps":30}"#,
+            r#"{"type":"config","pacing":"ack"}"#,
+            r#"{"type":"config","pacing":"push"}"#,
+            r#"{"type":"config","maxFps":0}"#,
+        ] {
+            ws.send(Message::Text(msg.to_string()))
+                .await
+                .expect("send config");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        server.broadcast_frame(r#"{"type":"frame","seq":9,"data":"live"}"#);
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.get("seq").and_then(|v| v.as_u64()), Some(9));
 
         server.shutdown().await;
     }

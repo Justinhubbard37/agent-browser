@@ -19,6 +19,72 @@ use super::{is_allowed_origin, timestamp_ms, IdleActivity};
 /// Highest per-client frame rate a client may request via the `config` message.
 const MAX_CONFIGURABLE_FPS: u32 = 120;
 
+/// Per-connection delivery settings, set by the client's `config` message.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct ClientConfig {
+    /// Frames per second ceiling. 0 means uncapped.
+    max_fps: u32,
+    /// When true, the writer keeps at most one frame in flight and waits for
+    /// the client to acknowledge it before sending the next.
+    ///
+    /// Without this, latest-frame-wins only holds up to the socket: frames the
+    /// writer has already handed to the transport are delivered in order, so a
+    /// client that stalls drains them as a stale backlog. Acknowledgement moves
+    /// the skip decision to the one place that knows the client kept up, which
+    /// is the same shape Chrome uses upstream (`Page.screencastFrameAck`).
+    ack_pacing: bool,
+}
+
+/// Parse a client `config` message into the settings it changes, leaving the
+/// rest of `current` untouched. Returns `None` when the message carries no
+/// recognized setting, so an unknown or malformed config never disturbs a
+/// working connection.
+fn apply_config(current: ClientConfig, parsed: &Value) -> Option<ClientConfig> {
+    let mut next = current;
+    let mut changed = false;
+
+    // Clamped on u64 before narrowing so oversized values cap at the maximum
+    // instead of wrapping.
+    if let Some(fps) = parsed.get("maxFps").and_then(|v| v.as_u64()) {
+        next.max_fps = fps.min(MAX_CONFIGURABLE_FPS as u64) as u32;
+        changed = true;
+    }
+    if let Some(pacing) = parsed.get("pacing").and_then(|v| v.as_str()) {
+        match pacing {
+            "ack" => {
+                next.ack_pacing = true;
+                changed = true;
+            }
+            "push" => {
+                next.ack_pacing = false;
+                changed = true;
+            }
+            _ => {}
+        }
+    }
+
+    if changed {
+        Some(next)
+    } else {
+        None
+    }
+}
+
+/// Read the acknowledged frame id from a client `ack` message. Acks are
+/// cumulative: a client that skipped intermediate ids still unblocks the
+/// writer by acknowledging the newest one it rendered.
+fn parse_ack_seq(parsed: &Value) -> Option<u64> {
+    parsed.get("seq").and_then(|v| v.as_u64())
+}
+
+/// Frame id carried by a serialized frame message, used to tell whether an
+/// incoming ack covers the frame currently in flight.
+fn frame_seq_of(frame: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(frame)
+        .ok()
+        .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
+}
+
 /// Earliest instant the next frame may be sent, given the last send and the
 /// current cap. `fps == 0` (uncapped) returns `last_sent` itself, which is
 /// already in the past, so the next frame is eligible immediately.
@@ -224,11 +290,12 @@ async fn handle_ws_client(
 
     let (mut ws_tx, ws_rx) = ws_stream.split();
 
-    // 0 means uncapped; set by the client via {"type":"config","maxFps":N}.
-    // A watch channel (not an atomic) so a mid-stream config change wakes the
-    // writer's select! below, letting it re-derive its throttle deadline
-    // immediately instead of riding out a stale one computed from the old rate.
-    let (max_fps_tx, mut max_fps_rx) = watch::channel::<u32>(0);
+    // Set by the client via {"type":"config", ...}. Watch channels (not
+    // atomics) so a mid-stream change wakes the writer's select! below, letting
+    // it re-derive its throttle deadline immediately instead of riding out a
+    // stale one computed from the old settings.
+    let (config_tx, mut config_rx) = watch::channel::<ClientConfig>(ClientConfig::default());
+    let (ack_tx, mut ack_rx) = watch::channel::<u64>(0);
     // Spawned before the status, tabs, and seed-frame writes below: those are
     // three unbounded sends, and a client whose receive queue is already full
     // would otherwise hold input hostage for the whole handshake.
@@ -236,7 +303,8 @@ async fn handle_ws_client(
         ws_rx,
         client_slot.clone(),
         cdp_session_id.clone(),
-        max_fps_tx,
+        config_tx,
+        ack_tx,
         idle_activity.clone(),
     ));
 
@@ -285,6 +353,10 @@ async fn handle_ws_client(
     let mut next_allowed = Instant::now();
     let mut last_sent = Instant::now();
     let mut pending_frame = false;
+    // Id of the frame written but not yet acknowledged, in ack pacing only.
+    // While this is set the writer holds off, and newer frames keep replacing
+    // each other in the watch channel instead of queueing in the socket.
+    let mut awaiting_ack: Option<u64> = None;
 
     loop {
         tokio::select! {
@@ -316,33 +388,55 @@ async fn handle_ws_client(
                 }
                 pending_frame = true;
             }
-            changed = max_fps_rx.changed() => {
-                // The client changed its cap. The sender lives as long as the
-                // reader task, so an error here means the reader ended: break
-                // and let cleanup run (mirrors the reader_task arm).
+            changed = config_rx.changed() => {
+                // The client changed its settings. The sender lives as long as
+                // the reader task, so an error here means the reader ended:
+                // break and let cleanup run (mirrors the reader_task arm).
                 if changed.is_err() {
                     break;
                 }
-                let fps = *max_fps_rx.borrow_and_update();
+                let cfg = *config_rx.borrow_and_update();
                 // Re-derive the deadline from the last send. Loosening the cap
                 // (or going uncapped) pulls next_allowed into the past so a
                 // pending frame goes out immediately instead of waiting on the
                 // old, slower deadline.
-                next_allowed = deadline_from(last_sent, fps);
+                next_allowed = deadline_from(last_sent, cfg.max_fps);
+                // Leaving ack pacing releases a frame that is still waiting on
+                // an acknowledgement the client will now never send.
+                if !cfg.ack_pacing {
+                    awaiting_ack = None;
+                }
             }
-            _ = tokio::time::sleep_until(next_allowed), if pending_frame => {
+            changed = ack_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let acked = *ack_rx.borrow_and_update();
+                // Cumulative: an ack for a newer frame covers the one in
+                // flight, so a client that renders out of order or skips ids
+                // still unblocks the writer.
+                if awaiting_ack.is_some_and(|seq| acked >= seq) {
+                    awaiting_ack = None;
+                }
+            }
+            _ = tokio::time::sleep_until(next_allowed), if pending_frame && awaiting_ack.is_none() => {
                 // Reading at send time (not at arrival time) is what makes this
                 // latest-frame-wins: frames that arrived during the throttle
-                // window are skipped, never queued.
+                // window, or while an earlier frame was awaiting its ack, are
+                // skipped, never queued.
                 let frame = frame_watch.borrow_and_update().clone();
                 pending_frame = false;
+                let cfg = *config_rx.borrow();
                 if let Some(frame) = frame {
+                    if cfg.ack_pacing {
+                        awaiting_ack = frame_seq_of(&frame);
+                    }
                     if ws_tx.send(Message::Text((*frame).clone())).await.is_err() {
                         break;
                     }
                 }
                 last_sent = Instant::now();
-                next_allowed = deadline_from(last_sent, *max_fps_rx.borrow());
+                next_allowed = deadline_from(last_sent, cfg.max_fps);
             }
         }
     }
@@ -357,16 +451,6 @@ async fn handle_ws_client(
     client_notify.notify_one();
 }
 
-/// Parse the `maxFps` value from a client `config` message, clamped to
-/// `MAX_CONFIGURABLE_FPS`. Clamps on u64 before narrowing so oversized
-/// values cap at the maximum instead of wrapping.
-fn parse_config_max_fps(parsed: &Value) -> Option<u32> {
-    parsed
-        .get("maxFps")
-        .and_then(|v| v.as_u64())
-        .map(|fps| fps.min(MAX_CONFIGURABLE_FPS as u64) as u32)
-}
-
 /// Reads client messages and dispatches them without ever waiting on frame
 /// delivery. Input events are forwarded to CDP sequentially to preserve
 /// ordering (mouse move/press/release must not be reordered).
@@ -374,7 +458,8 @@ async fn reader_loop(
     mut ws_rx: SplitStream<WebSocketStream<TcpStream>>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     cdp_session_id: Arc<RwLock<Option<String>>>,
-    max_fps: watch::Sender<u32>,
+    config: watch::Sender<ClientConfig>,
+    ack: watch::Sender<u64>,
     idle_activity: Arc<IdleActivity>,
 ) {
     while let Some(msg) = ws_rx.next().await {
@@ -386,11 +471,32 @@ async fn reader_loop(
                 };
                 let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 if msg_type == "config" {
-                    if let Some(fps) = parse_config_max_fps(&parsed) {
+                    // Bound to a local first: a `watch` Ref taken directly in
+                    // the `if let` scrutinee stays alive for the whole body,
+                    // and `send_replace` would then deadlock against the read
+                    // guard this same task is still holding.
+                    let current = *config.borrow();
+                    if let Some(next) = apply_config(current, &parsed) {
                         // send_replace (not send) so the writer is woken even
                         // when the value is unchanged; it must re-derive its
-                        // deadline from the new rate on every config message.
-                        let _ = max_fps.send_replace(fps);
+                        // deadline from the new settings on every config message.
+                        let _ = config.send_replace(next);
+                    }
+                    continue;
+                }
+                if msg_type == "ack" {
+                    if let Some(seq) = parse_ack_seq(&parsed) {
+                        // send_if_modified keeps the acknowledged id monotonic:
+                        // a late ack for an older frame must not walk it back
+                        // and re-block the writer.
+                        ack.send_if_modified(|current| {
+                            if seq > *current {
+                                *current = seq;
+                                true
+                            } else {
+                                false
+                            }
+                        });
                     }
                     continue;
                 }
@@ -487,35 +593,26 @@ mod tests {
         assert!(!is_user_input_message_type("frame"));
     }
 
-    fn config(v: serde_json::Value) -> Value {
-        v
+    fn fps_of(msg: serde_json::Value) -> Option<u32> {
+        apply_config(ClientConfig::default(), &msg).map(|c| c.max_fps)
     }
 
     #[test]
     fn test_parse_config_max_fps_valid() {
-        assert_eq!(
-            parse_config_max_fps(&config(json!({"type": "config", "maxFps": 10}))),
-            Some(10)
-        );
-        assert_eq!(
-            parse_config_max_fps(&config(json!({"type": "config", "maxFps": 0}))),
-            Some(0)
-        );
-        assert_eq!(
-            parse_config_max_fps(&config(json!({"type": "config", "maxFps": 120}))),
-            Some(120)
-        );
+        assert_eq!(fps_of(json!({"type": "config", "maxFps": 10})), Some(10));
+        assert_eq!(fps_of(json!({"type": "config", "maxFps": 0})), Some(0));
+        assert_eq!(fps_of(json!({"type": "config", "maxFps": 120})), Some(120));
     }
 
     #[test]
     fn test_parse_config_max_fps_clamps_without_wrapping() {
         assert_eq!(
-            parse_config_max_fps(&config(json!({"type": "config", "maxFps": 500}))),
+            fps_of(json!({"type": "config", "maxFps": 500})),
             Some(MAX_CONFIGURABLE_FPS)
         );
         // u32::MAX + 2 would wrap to 1 if narrowed before clamping.
         assert_eq!(
-            parse_config_max_fps(&config(json!({"type": "config", "maxFps": 4294967297u64}))),
+            fps_of(json!({"type": "config", "maxFps": 4294967297u64})),
             Some(MAX_CONFIGURABLE_FPS)
         );
     }
@@ -523,16 +620,67 @@ mod tests {
     #[test]
     fn test_parse_config_max_fps_invalid() {
         assert_eq!(
-            parse_config_max_fps(&config(json!({"type": "config"}))),
+            apply_config(ClientConfig::default(), &json!({"type": "config"})),
             None
         );
+        assert_eq!(fps_of(json!({"type": "config", "maxFps": -5})), None);
+        assert_eq!(fps_of(json!({"type": "config", "maxFps": "fast"})), None);
+    }
+
+    #[test]
+    fn test_config_pacing_opt_in_and_out() {
+        let acked = apply_config(
+            ClientConfig::default(),
+            &json!({"type": "config", "pacing": "ack"}),
+        )
+        .expect("pacing is a recognized setting");
+        assert!(acked.ack_pacing);
+
+        let back_to_push = apply_config(acked, &json!({"type": "config", "pacing": "push"}))
+            .expect("push is a recognized setting");
+        assert!(!back_to_push.ack_pacing);
+
+        // An unknown pacing value leaves the connection as it was.
         assert_eq!(
-            parse_config_max_fps(&config(json!({"type": "config", "maxFps": -5}))),
+            apply_config(acked, &json!({"type": "config", "pacing": "turbo"})),
             None
         );
-        assert_eq!(
-            parse_config_max_fps(&config(json!({"type": "config", "maxFps": "fast"}))),
-            None
-        );
+    }
+
+    #[test]
+    fn test_config_settings_are_independent() {
+        // Changing the cap must not silently drop the client out of ack pacing,
+        // which would let the backlog it prevents come back.
+        let acked = apply_config(
+            ClientConfig::default(),
+            &json!({"type": "config", "pacing": "ack"}),
+        )
+        .unwrap();
+        let recapped = apply_config(acked, &json!({"type": "config", "maxFps": 15})).unwrap();
+        assert_eq!(recapped.max_fps, 15);
+        assert!(recapped.ack_pacing);
+
+        // And the reverse: opting into pacing keeps an existing cap.
+        let repaced = apply_config(recapped, &json!({"type": "config", "pacing": "push"})).unwrap();
+        assert_eq!(repaced.max_fps, 15);
+        assert!(!repaced.ack_pacing);
+    }
+
+    #[test]
+    fn test_parse_ack_seq() {
+        assert_eq!(parse_ack_seq(&json!({"type": "ack", "seq": 42})), Some(42));
+        assert_eq!(parse_ack_seq(&json!({"type": "ack"})), None);
+        assert_eq!(parse_ack_seq(&json!({"type": "ack", "seq": -1})), None);
+        assert_eq!(parse_ack_seq(&json!({"type": "ack", "seq": "42"})), None);
+    }
+
+    #[test]
+    fn test_frame_seq_of_reads_the_id_the_client_acks() {
+        let frame = json!({"type": "frame", "seq": 7, "data": "abc"}).to_string();
+        assert_eq!(frame_seq_of(&frame), Some(7));
+        // A frame without an id leaves the writer unblocked rather than
+        // stalling forever on an ack that can never match.
+        assert_eq!(frame_seq_of(&json!({"type": "frame"}).to_string()), None);
+        assert_eq!(frame_seq_of("not json"), None);
     }
 }

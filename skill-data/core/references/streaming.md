@@ -36,6 +36,22 @@ Connect a WebSocket client to `ws://127.0.0.1:<port>`. Frame delivery starts aut
 Every message is JSON text with a `type` field.
 
 - `frame`: a viewport image plus its metadata. Delivered latest-first (see below).
+
+```json
+{
+  "type": "frame",
+  "seq": 41,
+  "data": "<base64-encoded-jpeg>",
+  "metadata": {
+    "deviceWidth": 1280, "deviceHeight": 720, "pageScaleFactor": 1,
+    "offsetTop": 0, "scrollOffsetX": 0, "scrollOffsetY": 0,
+    "timestamp": 1785038682238
+  }
+}
+```
+
+`seq` is a monotonic frame id, echoed back under ack pacing and stable across browser relaunches. `metadata.timestamp` is the capture time in epoch milliseconds, so `Date.now() - timestamp` is the age of the frame being drawn. The other message types:
+
 - `status`: connection state, screencasting flag, viewport size, engine, recording flag. Sent once on connect and again on change.
 - `tabs`: the current tab list, sent on connect when tabs are known and on change.
 - `url`, `console`: navigation and console events.
@@ -49,6 +65,8 @@ Status, tabs, url, and console travel on an ordered channel and are never droppe
 {"type": "input_keyboard", "eventType": "keyDown", "key": "a", "text": "a"}
 {"type": "input_touch", "eventType": "touchStart", "touchPoints": []}
 {"type": "config", "maxFps": 10}
+{"type": "config", "pacing": "ack"}
+{"type": "ack", "seq": 41}
 ```
 
 Input dispatches to the browser on a task of its own, separate from frame delivery, so a click is not queued behind a frame write. Mouse, keyboard, and touch input also reset the daemon idle timer, so an actively driven preview is not shut down by the idle timeout.
@@ -59,10 +77,16 @@ Input dispatches to the browser on a task of its own, separate from frame delive
 
 The server holds only the newest frame per client and reads it at send time. A frame produced while an earlier one is still being written is skipped, not queued, so the application never builds a backlog.
 
-The transport underneath is still ordered: frames already accepted by the socket are delivered in order. A client that stops reading entirely drains whatever the kernel buffered before the writer blocked. `maxFps` bounds that window, because the server only produces frames for that client at the requested rate. A preview that expects to stall (a background tab, a throttled render loop) should set a low `maxFps` rather than rely on uncapped delivery.
+Push pacing (the default) stops there, and the transport underneath is still ordered: frames already accepted by the socket are delivered in order, so a client that stalls drains whatever the kernel buffered before the writer blocked.
+
+Ack pacing closes that gap. Send `{"type":"config","pacing":"ack"}` and the server keeps at most one frame in flight, waiting for `{"type":"ack","seq":N}` before sending the next. Every frame carries a monotonic `seq`; echo the one you finished rendering. Frames produced while an ack is outstanding replace each other and never reach the socket, so a client that stalls for ten seconds and resumes gets the current page, not ten seconds of history.
+
+Acks are cumulative, so acknowledging a newer id covers any older one. A client that opts in and then stops acking simply stops receiving frames; status, tabs, url, and console keep flowing.
+
+The two settings compose: `pacing` bounds how much is in flight, `maxFps` bounds the rate. A constrained preview usually wants both.
 
 ## Limitations
 
 - Localhost only. Exposing the stream beyond the machine is the embedder's job (tunnel, proxy, or port forward), and the origin allowlist applies to browser clients.
 - Frames are images, not a video codec. Bandwidth scales with viewport size and page activity; cap the rate for constrained links.
-- There is no delivery acknowledgement, so the server cannot tell a slow renderer from a fast one beyond transport backpressure.
+- In push pacing the server cannot tell a slow renderer from a fast one beyond transport backpressure. Use ack pacing when that distinction matters.
