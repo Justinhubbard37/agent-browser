@@ -2859,7 +2859,7 @@ async fn apply_tab_binding_on_attach_or_rollback(state: &mut DaemonState) -> Res
     match apply_tab_binding_on_attach(state).await {
         Ok(v) => Ok(v),
         Err(e) => {
-            let _ = close_current_browser(state).await;
+            let _ = rollback_failed_launch(state).await;
             Err(e)
         }
     }
@@ -3403,7 +3403,10 @@ async fn auto_launch(
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_auto().await?);
         if !apply_tab_binding_on_attach_or_rollback(state).await? {
-            open_fresh_tab_for_auto_connect(state).await?;
+            if let Err(e) = open_fresh_tab_for_auto_connect(state).await {
+                let _ = rollback_failed_launch(state).await;
+                return Err(e);
+            }
         }
         state.launch_hash = Some(hash);
         state.subscribe_to_browser_events();
@@ -4313,7 +4316,10 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_auto().await?);
         if !apply_tab_binding_on_attach_or_rollback(state).await? {
-            open_fresh_tab_for_auto_connect(state).await?;
+            if let Err(e) = open_fresh_tab_for_auto_connect(state).await {
+                let _ = rollback_failed_launch(state).await;
+                return Err(e);
+            }
         }
         state.launch_hash = Some(new_hash);
         state.subscribe_to_browser_events();
