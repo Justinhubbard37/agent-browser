@@ -70,6 +70,47 @@ fn apply_config(current: ClientConfig, parsed: &Value) -> Option<ClientConfig> {
     }
 }
 
+/// Settings declared on the WebSocket URL, applied before the first frame.
+///
+/// A `config` message cannot cover the connection's opening frames: the server
+/// has already sent the cached frame by the time the message arrives, so a
+/// client that wants ack pacing from the very first frame has no way to say so.
+/// `ws://host/?pacing=ack&maxFps=10` closes that window. An unparsable value is
+/// ignored, leaving the default, and a later `config` message still wins.
+fn config_from_upgrade(request: &str) -> ClientConfig {
+    let mut cfg = ClientConfig::default();
+    let Some(query) = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|target| target.split_once('?'))
+        .map(|(_, query)| query)
+    else {
+        return cfg;
+    };
+
+    for (key, value) in query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (k.trim(), v.trim()))
+    {
+        match key {
+            "maxFps" => {
+                if let Ok(fps) = value.parse::<u64>() {
+                    cfg.max_fps = fps.min(MAX_CONFIGURABLE_FPS as u64) as u32;
+                }
+            }
+            "pacing" => match value {
+                "ack" => cfg.ack_pacing = true,
+                "push" => cfg.ack_pacing = false,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    cfg
+}
+
 /// Read the acknowledged frame id from a client `ack` message. Acks are
 /// cumulative: a client that skipped intermediate ids still unblocks the
 /// writer by acknowledging the newest one it rendered.
@@ -211,9 +252,11 @@ async fn handle_connection(
 
     if is_websocket_upgrade(&request) {
         let frame_rx = frame_tx.subscribe();
+        let initial_config = config_from_upgrade(&request);
         handle_ws_client(
             stream,
             addr,
+            initial_config,
             frame_rx,
             frame_watch,
             client_count,
@@ -244,6 +287,7 @@ async fn handle_connection(
 async fn handle_ws_client(
     stream: TcpStream,
     _addr: SocketAddr,
+    initial_config: ClientConfig,
     mut broadcast_rx: broadcast::Receiver<String>,
     mut frame_watch: watch::Receiver<Option<Arc<String>>>,
     client_count: Arc<Mutex<usize>>,
@@ -294,7 +338,7 @@ async fn handle_ws_client(
     // atomics) so a mid-stream change wakes the writer's select! below, letting
     // it re-derive its throttle deadline immediately instead of riding out a
     // stale one computed from the old settings.
-    let (config_tx, mut config_rx) = watch::channel::<ClientConfig>(ClientConfig::default());
+    let (config_tx, mut config_rx) = watch::channel::<ClientConfig>(initial_config);
     let (ack_tx, mut ack_rx) = watch::channel::<u64>(0);
     // Spawned before the status, tabs, and seed-frame writes below: those are
     // three unbounded sends, and a client whose receive queue is already full
@@ -340,8 +384,16 @@ async fn handle_ws_client(
 
     // Seed the client with the most recent frame, marking it seen so the
     // writer loop below does not immediately re-send the same frame.
+    //
+    // Under ack pacing declared on the URL this frame counts as the one in
+    // flight, so the invariant holds from the very first frame rather than from
+    // whenever a `config` message happens to arrive.
+    let mut awaiting_ack: Option<u64> = None;
     let initial_frame = frame_watch.borrow_and_update().clone();
     if let Some(frame) = initial_frame {
+        if initial_config.ack_pacing {
+            awaiting_ack = frame_seq_of(&frame);
+        }
         let _ = ws_tx.send(Message::Text((*frame).clone())).await;
     }
 
@@ -353,10 +405,10 @@ async fn handle_ws_client(
     let mut next_allowed = Instant::now();
     let mut last_sent = Instant::now();
     let mut pending_frame = false;
-    // Id of the frame written but not yet acknowledged, in ack pacing only.
-    // While this is set the writer holds off, and newer frames keep replacing
-    // each other in the watch channel instead of queueing in the socket.
-    let mut awaiting_ack: Option<u64> = None;
+    // `awaiting_ack` holds the id of the frame written but not yet
+    // acknowledged, in ack pacing only. While it is set the writer holds off,
+    // and newer frames keep replacing each other in the watch channel instead
+    // of queueing in the socket. It is seeded above by the opening frame.
 
     loop {
         tokio::select! {
@@ -430,6 +482,14 @@ async fn handle_ws_client(
                 if let Some(frame) = frame {
                     if cfg.ack_pacing {
                         awaiting_ack = frame_seq_of(&frame);
+                        // Settle against what the client has already
+                        // acknowledged, rather than waiting only for the next
+                        // notification. A client that acknowledged an id ahead
+                        // of anything sent would otherwise never move the
+                        // watermark again, and its stream would stop for good.
+                        if awaiting_ack.is_some_and(|seq| *ack_rx.borrow() >= seq) {
+                            awaiting_ack = None;
+                        }
                     }
                     if ws_tx.send(Message::Text((*frame).clone())).await.is_err() {
                         break;
@@ -664,6 +724,56 @@ mod tests {
         let repaced = apply_config(recapped, &json!({"type": "config", "pacing": "push"})).unwrap();
         assert_eq!(repaced.max_fps, 15);
         assert!(!repaced.ack_pacing);
+    }
+
+    fn upgrade(target: &str) -> String {
+        format!(
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\r\n",
+            target
+        )
+    }
+
+    #[test]
+    fn test_config_from_upgrade_reads_url_settings() {
+        let cfg = config_from_upgrade(&upgrade("/?pacing=ack&maxFps=10"));
+        assert!(cfg.ack_pacing);
+        assert_eq!(cfg.max_fps, 10);
+
+        let cfg = config_from_upgrade(&upgrade("/?maxFps=5"));
+        assert!(!cfg.ack_pacing);
+        assert_eq!(cfg.max_fps, 5);
+    }
+
+    #[test]
+    fn test_config_from_upgrade_defaults_when_absent_or_unparsable() {
+        for target in [
+            "/",
+            "/?",
+            "/?pacing=turbo",
+            "/?maxFps=fast",
+            "/?maxFps=-1",
+            "/?other=1",
+        ] {
+            assert_eq!(
+                config_from_upgrade(&upgrade(target)),
+                ClientConfig::default(),
+                "target {} should leave the defaults alone",
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_from_upgrade_clamps_max_fps() {
+        assert_eq!(
+            config_from_upgrade(&upgrade("/?maxFps=100000")).max_fps,
+            MAX_CONFIGURABLE_FPS
+        );
+        // Wider than u32: must clamp rather than wrap or fall back to the default.
+        assert_eq!(
+            config_from_upgrade(&upgrade("/?maxFps=4294967297")).max_fps,
+            MAX_CONFIGURABLE_FPS
+        );
     }
 
     #[test]

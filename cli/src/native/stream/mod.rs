@@ -554,9 +554,14 @@ mod tests {
     >;
 
     async fn connect_client(port: u16) -> WsClient {
-        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", port))
-            .await
-            .expect("client connect");
+        connect_client_to(port, "/").await
+    }
+
+    async fn connect_client_to(port: u16, target: &str) -> WsClient {
+        let (ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}{}", port, target))
+                .await
+                .expect("client connect");
         ws
     }
 
@@ -578,7 +583,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_new_client_receives_latest_frame_only() {
         let (server, _slot) = StreamServer::start_without_client(
             0,
@@ -600,7 +605,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_max_fps_cap_skips_stale_frames() {
         let (server, _slot) = StreamServer::start_without_client(
             0,
@@ -661,7 +666,7 @@ mod tests {
     /// client owes an acknowledgement collapse to the newest one. Without this,
     /// latest-frame-wins stops at the socket: everything already written is
     /// delivered in order, so a client that stalls drains a stale backlog.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_ack_pacing_holds_one_frame_and_skips_to_newest() {
         let (server, _slot) = StreamServer::start_without_client(
             0,
@@ -700,9 +705,85 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// Ack pacing declared on the URL covers the connection's opening frame. A
+    /// `config` message cannot: by the time it arrives the cached frame has
+    /// already been written, so a client that opted in immediately still got two
+    /// frames without acknowledging either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_url_ack_pacing_covers_the_opening_frame() {
+        let (server, _slot) = StreamServer::start_without_client(
+            0,
+            "t10".to_string(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .expect("server start");
+
+        // A frame exists before the client connects, so it will be seeded.
+        server.broadcast_frame(r#"{"type":"frame","seq":1,"data":"seed"}"#);
+        let mut ws = connect_client_to(server.port(), "/?pacing=ack").await;
+
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.get("seq").and_then(|v| v.as_u64()), Some(1));
+
+        // Nothing else may follow while the seed is unacknowledged.
+        server.broadcast_frame(r#"{"type":"frame","seq":2,"data":"two"}"#);
+        server.broadcast_frame(r#"{"type":"frame","seq":3,"data":"three"}"#);
+        expect_no_frame(&mut ws, 300).await;
+
+        ws.send(Message::Text(r#"{"type":"ack","seq":1}"#.to_string()))
+            .await
+            .expect("send ack");
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.get("seq").and_then(|v| v.as_u64()), Some(3));
+
+        server.shutdown().await;
+    }
+
+    /// A client that acknowledges an id ahead of anything it was sent must not
+    /// wedge its own stream. The acknowledged watermark only moves forward, so
+    /// a premature high ack would otherwise swallow every later acknowledgement
+    /// and the writer would wait on a notification that never comes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_ack_ahead_of_the_stream_does_not_wedge_the_writer() {
+        let (server, _slot) = StreamServer::start_without_client(
+            0,
+            "t9".to_string(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .expect("server start");
+
+        let mut ws = connect_client(server.port()).await;
+        ws.send(Message::Text(
+            r#"{"type":"config","pacing":"ack"}"#.to_string(),
+        ))
+        .await
+        .expect("send config");
+        ws.send(Message::Text(r#"{"type":"ack","seq":9999999}"#.to_string()))
+            .await
+            .expect("send premature ack");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Delivery continues: each frame is covered by the watermark already
+        // banked, so the writer never blocks on it.
+        for (seq, data) in [(1, "one"), (2, "two"), (3, "three")] {
+            server.broadcast_frame(&format!(
+                r#"{{"type":"frame","seq":{},"data":"{}"}}"#,
+                seq, data
+            ));
+            let frame = next_frame(&mut ws).await;
+            assert_eq!(frame.get("seq").and_then(|v| v.as_u64()), Some(seq));
+        }
+
+        server.shutdown().await;
+    }
+
     /// Returning to push pacing must release a frame that is still waiting on
     /// an acknowledgement the client will now never send.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_leaving_ack_pacing_releases_the_held_frame() {
         let (server, _slot) = StreamServer::start_without_client(
             0,
@@ -744,7 +825,7 @@ mod tests {
     /// and a client in ack pacing that had already acknowledged a higher id
     /// would treat every later frame as older than its watermark, so its
     /// stream stopped permanently.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_frame_ids_survive_a_stream_server_restart() {
         let meta = FrameMetadata::default();
 
@@ -795,7 +876,7 @@ mod tests {
     /// channel. Regression guard: reading the current settings directly in the
     /// `if let` scrutinee kept the read guard alive across `send_replace`, and
     /// the connection went silent from the first config message onward.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_repeated_config_messages_keep_the_connection_live() {
         let (server, _slot) = StreamServer::start_without_client(
             0,
@@ -826,7 +907,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_uncapped_client_receives_consecutive_frames() {
         let (server, _slot) = StreamServer::start_without_client(
             0,
@@ -838,7 +919,10 @@ mod tests {
         .expect("server start");
 
         let mut ws = connect_client(server.port()).await;
-        // No config message: delivery is uncapped by default.
+        // No config message: delivery is uncapped by default. Timed, because
+        // asserting only that both frames arrive passes at any rate: a default
+        // of 1 fps still delivers two frames, just a second apart.
+        let started = tokio::time::Instant::now();
         server.broadcast_frame(r#"{"type":"frame","data":"one"}"#);
         let frame = next_frame(&mut ws).await;
         assert_eq!(frame.get("data").and_then(|v| v.as_str()), Some("one"));
@@ -847,6 +931,13 @@ mod tests {
         let frame = next_frame(&mut ws).await;
         assert_eq!(frame.get("data").and_then(|v| v.as_str()), Some("two"));
 
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "two frames took {:?}: delivery is being throttled, so the default is not uncapped",
+            elapsed
+        );
+
         server.shutdown().await;
     }
 
@@ -854,7 +945,7 @@ mod tests {
     /// Regression guard: previously the writer stayed asleep on the deadline
     /// computed from the old (slower) rate, so the first frame after switching
     /// from 1 fps to uncapped was delayed by nearly the old interval (~1s).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_loosening_cap_midstream_takes_effect_immediately() {
         let (server, _slot) = StreamServer::start_without_client(
             0,

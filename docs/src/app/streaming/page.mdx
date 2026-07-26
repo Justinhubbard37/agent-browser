@@ -92,7 +92,7 @@ Connection and screencast status:
 
 Frames are delivered latest-first: the server holds only the newest frame and reads it at send time, so every frame produced while an earlier one is still being written is skipped instead of queued. The application never builds a backlog.
 
-In the default push pacing the transport underneath still can: frames already accepted by the socket are delivered in order, so a client that stops reading entirely drains whatever the kernel buffered before the writer blocked. Ack pacing removes that window (see below). Status, console, and tab messages flow through a separate ordered channel and are not subject to frame dropping.
+In the default push pacing the transport underneath still can: frames already accepted by the socket are delivered in order, so a client that stops reading entirely drains whatever the kernel buffered before the writer blocked. Ack pacing removes that window (see below). Status, console, and tab messages flow through a separate ordered channel, so they are never replaced by a newer message the way frames are. They are not unconditionally durable: a client that falls far enough behind can lag out of that channel and lose messages, so treat console output as a live feed rather than an audit log.
 
 Input handling is independent of frame delivery. Each connection reads input on its own task, so clicks and keystrokes dispatch to the browser immediately even while a large frame is mid-write to a slow client.
 
@@ -134,6 +134,14 @@ Every `frame` message carries a monotonic `seq`. Echo the id of the frame you fi
 Acks are cumulative: acknowledging a newer id covers every older one, so a client that skips ids still unblocks delivery. A client that opts in and then stops acknowledging simply stops receiving frames, while status, tabs, url, and console keep flowing. Send `{"type":"config","pacing":"push"}` to return to the default.
 
 `pacing` and `maxFps` are independent and compose: pacing bounds how much is in flight, `maxFps` bounds the rate. A preview on a constrained link usually wants both.
+
+A `config` message cannot cover the connection's opening frame, because the server sends the most recent frame as soon as the client connects. To have pacing apply from the very first frame, declare it on the URL instead:
+
+```
+ws://127.0.0.1:<port>/?pacing=ack&maxFps=10
+```
+
+A `config` message sent later still wins. An unrecognized or unparsable value on the URL is ignored rather than failing the connection.
 
 ## Input injection
 

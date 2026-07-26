@@ -56,7 +56,7 @@ Every message is JSON text with a `type` field.
 - `tabs`: the current tab list, sent on connect when tabs are known and on change.
 - `url`, `console`: navigation and console events.
 
-Status, tabs, url, and console travel on an ordered channel and are never dropped. Only frames are subject to dropping.
+Status, tabs, url, and console travel on an ordered channel: they are delivered in order and are never replaced by a newer message the way frames are. They are not unconditionally durable. A client that falls far enough behind can lag out of that channel and lose messages it never saw, so treat console output as a live feed, not an audit log.
 
 ## Messages from the client
 
@@ -71,7 +71,9 @@ Status, tabs, url, and console travel on an ordered channel and are never droppe
 
 Input dispatches to the browser on a task of its own, separate from frame delivery, so a click is not queued behind a frame write. Mouse, keyboard, and touch input also reset the daemon idle timer, so an actively driven preview is not shut down by the idle timeout.
 
-`config` sets a per-client frame cap: 1 to 120, or `0` for uncapped (the default). It takes effect immediately, including when it loosens the cap. Each client's cap is its own; other connected clients are unaffected. Out-of-range and non-numeric values are ignored rather than rejecting the connection.
+`config` sets a per-client frame cap: 1 to 120, or `0` for uncapped (the default). It takes effect immediately, including when it loosens the cap. Each client's cap is its own; other connected clients are unaffected. A value above 120 is clamped to 120; a negative or non-numeric value is ignored, leaving the current cap in place. Neither rejects the connection.
+
+Both settings can also be declared on the URL, which is the only way to have them cover the connection's opening frame: `ws://127.0.0.1:<port>/?pacing=ack&maxFps=10`. A `config` message sent after connecting still wins.
 
 ## Frame rate and staleness
 
