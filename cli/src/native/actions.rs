@@ -11448,17 +11448,11 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    /// A binding-recovery failure must tear the connection down, not leave a
-    /// half-recovered one behind: the attach paths set `state.browser` before
-    /// calling this, so returning the error alone would let the next command
-    /// skip the attach path and act on whatever tab happens to be selected.
-    /// The rollback is observed through `launch_hash`, which
-    /// `rollback_failed_launch` clears via `close_current_browser`. Force-red:
-    /// drop the `rollback_failed_launch` call from the wrapper's error arm and
-    /// `launch_hash` survives the error. Coverage note: this drives the
-    /// wrapper, not the attach sites, and drives the corrupt-binding failure, which
-    /// happens before the manager is touched, so it pins the wrapper's error
-    /// branch rather than the teardown of a live CDP connection.
+    /// A binding-recovery failure must tear the connection down: the attach
+    /// paths set `state.browser` before calling this, so returning the error
+    /// alone would let the next command skip the attach path and act on
+    /// whatever tab is selected. Force-red: drop `rollback_failed_launch`
+    /// from the error arm and `launch_hash` survives the error.
     #[tokio::test]
     async fn apply_tab_binding_rollback_clears_launch_state_on_recovery_failure() {
         let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);

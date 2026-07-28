@@ -4047,12 +4047,10 @@ mod tests {
         );
     }
 
-    /// The pin restore path re-selects a persisted tab that Memory Saver may
-    /// have discarded. Enabling CDP domains on it directly hangs on
-    /// `Page.enable` (no renderer answers), so the restore path must revive
-    /// first, exactly as tab switch and tab close already do. Force-red:
-    /// replace the `ensure_renderer_alive` call in `revive_and_enable_active`
-    /// with a bare `enable_domains` and this times out instead of returning.
+    /// The restore path re-selects a persisted tab that Memory Saver may have
+    /// discarded; enabling domains on it directly hangs on `Page.enable`, so
+    /// it must revive first, like tab switch and close. Force-red: swap the
+    /// revive for a bare `enable_domains` and this times out.
     #[tokio::test]
     async fn test_revive_and_enable_active_revives_discarded_bound_tab() {
         let (url, activations) =
