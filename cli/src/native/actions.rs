@@ -11448,6 +11448,47 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    /// A binding-recovery failure must tear the connection down, not leave a
+    /// half-recovered one behind: the attach paths set `state.browser` before
+    /// calling this, so returning the error alone would let the next command
+    /// skip the attach path and act on whatever tab happens to be selected.
+    /// The rollback is observed through `launch_hash`, which
+    /// `rollback_failed_launch` clears via `close_current_browser`. Force-red:
+    /// drop the `rollback_failed_launch` call from the wrapper's error arm and
+    /// `launch_hash` survives the error. Coverage note: this drives the
+    /// wrapper, not the attach sites, and drives the corrupt-binding failure, which
+    /// happens before the manager is touched, so it pins the wrapper's error
+    /// branch rather than the teardown of a live CDP connection.
+    #[tokio::test]
+    async fn apply_tab_binding_rollback_clears_launch_state_on_recovery_failure() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("XDG_RUNTIME_DIR");
+
+        let mut state = DaemonState::new();
+        fs::write(
+            super::tab_binding::binding_path(&state.session_id),
+            "{not valid json",
+        )
+        .unwrap();
+        state.launch_hash = Some(42);
+
+        let err = apply_tab_binding_on_attach_or_rollback(&mut state)
+            .await
+            .expect_err("a corrupt binding file is a recovery failure");
+
+        assert!(
+            err.contains("corrupt tab binding file"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            state.launch_hash.is_none(),
+            "the failed attach must be rolled back, not left committed"
+        );
+    }
+
     /// `find --help`, the MCP tool schema, and the docs/skill references are
     /// plain text, not generated from `FIND_ACTIONS`; this pins their
     /// wording to the actual accepted set so an edit to one without the

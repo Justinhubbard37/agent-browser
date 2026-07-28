@@ -750,10 +750,6 @@ impl BrowserManager {
         Ok(())
     }
 
-    pub async fn enable_domains_pub(&self, session_id: &str) -> Result<(), String> {
-        self.enable_domains(session_id).await
-    }
-
     /// Revive the active tab if the browser discarded it (Memory Saver), then
     /// enable CDP domains on it. The pin-tab restore path re-selects a
     /// persisted tab that may be discarded; enabling domains on it directly
@@ -4048,6 +4044,35 @@ mod tests {
         assert!(
             activations.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "the only (discarded) tab must be revived when there is no live fallback"
+        );
+    }
+
+    /// The pin restore path re-selects a persisted tab that Memory Saver may
+    /// have discarded. Enabling CDP domains on it directly hangs on
+    /// `Page.enable` (no renderer answers), so the restore path must revive
+    /// first, exactly as tab switch and tab close already do. Force-red:
+    /// replace the `ensure_renderer_alive` call in `revive_and_enable_active`
+    /// with a bare `enable_domains` and this times out instead of returning.
+    #[tokio::test]
+    async fn test_revive_and_enable_active_revives_discarded_bound_tab() {
+        let (url, activations) =
+            start_mock_cdp_connect(vec![("LIVE", true), ("BOUND", false)], true).await;
+        let mut mgr = BrowserManager::connect_cdp(&url)
+            .await
+            .expect("connect should select the live tab");
+        let activations_after_connect = activations.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Re-select the discarded tab the way the restore path does.
+        assert!(mgr.restore_target_binding("BOUND", "https://bound.example"));
+
+        tokio::time::timeout(Duration::from_secs(20), mgr.revive_and_enable_active())
+            .await
+            .expect("restoring onto a discarded tab must not hang on Page.enable")
+            .expect("domains should enable once the tab is revived");
+
+        assert!(
+            activations.load(std::sync::atomic::Ordering::SeqCst) > activations_after_connect,
+            "the discarded bound tab must be reactivated before domains are enabled"
         );
     }
 
